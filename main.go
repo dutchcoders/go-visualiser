@@ -1,29 +1,25 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	marija, err := New(WithURL("https://demo.marija.io/submit?honeytrap"))
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	marija.Start(ctx)
+	marija.Start()
+	defer marija.Stop()
 
-	do := func(p string) {
+	do := func(p string, rp string) {
 		fset := token.NewFileSet() // positions are relative to fset
 
 		// Parse src but stop after processing the imports.
@@ -42,7 +38,7 @@ func main() {
 
 		m := map[string]interface{}{}
 		m["imports"] = imports
-		m["file"] = "main.go"
+		m["file"] = rp
 		marija.Send(m)
 
 		for _, decl := range f.Decls {
@@ -53,11 +49,15 @@ func main() {
 
 			name := fd.Name.Name
 
+			m := map[string]interface{}{}
+			m["file"] = rp
+			m["name"] = fmt.Sprintf("%s.%s", f.Name, name)
+			marija.Send(m)
+
 			references := []string{}
 
 			var inspectFunc func(ast.Node) bool
 			inspectFunc = func(n ast.Node) bool {
-				fmt.Printf("%#+v\n", n)
 				// For selector expressions, only inspect the left hand side.
 				// (For an expression like fmt.Println, only add "fmt" to the
 				// set of unresolved names, not "Println".)
@@ -74,19 +74,16 @@ func main() {
 				}
 
 				if ce, ok := n.(*ast.CallExpr); ok {
-					fmt.Printf("%#+v\n", ce, ce.Fun)
-
 					if se, ok := ce.Fun.(*ast.SelectorExpr); ok {
 						references = append(references, fmt.Sprintf("%s.%s", se.X, se.Sel))
 					}
 				}
 
 				if id, ok := n.(*ast.Ident); ok {
-					fmt.Printf("%#+v\n", id)
 					if id.Obj != nil {
-						fmt.Println("obj", id.Name, id.Obj, id.String(), id.Obj)
+						// fmt.Println("obj", id.Name, id.Obj, id.String(), id.Obj)
 					} else {
-						fmt.Println(id.Name, id.Obj, id.String())
+						// fmt.Println(id.Name, id.Obj, id.String())
 					}
 				}
 
@@ -95,11 +92,6 @@ func main() {
 
 			ast.Inspect(fd.Body, inspectFunc)
 
-			m := map[string]interface{}{}
-			m["file"] = "main.go"
-			m["name"] = fmt.Sprintf("%s.%s", f.Name, name)
-			marija.Send(m)
-
 			m = map[string]interface{}{}
 			m["references"] = references
 			m["name"] = fmt.Sprintf("%s.%s", f.Name, name)
@@ -107,23 +99,33 @@ func main() {
 		}
 	}
 
-	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(os.Args[1], func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			fmt.Printf("prevent panic by handling failure accessing a path %q: %v\n", path, err)
 			return err
+		}
+
+		if info.IsDir() && info.Name() == "vendor" {
+			fmt.Printf("skipping a dir without errors: %+v \n", info.Name())
+			return filepath.SkipDir
 		}
 
 		if filepath.Ext(path) != ".go" {
 			return nil
 		}
 
-		do(path)
+		relPath, err := filepath.Rel(os.Args[1], path)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(relPath)
+
+		do(path, relPath)
 		return nil
 	})
 
 	if err != nil {
 		fmt.Println(err.Error())
 	}
-
-	time.Sleep(10 * time.Minute)
 }

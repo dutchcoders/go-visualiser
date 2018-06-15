@@ -31,11 +31,11 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"time"
 
@@ -48,26 +48,31 @@ type Config struct {
 	Insecure bool `toml:"insecure"`
 }
 
-// Backend defines a struct which provides a channel for delivery
+// MarijaClient defines a struct which provides a channel for delivery
 // push messages to an elasticsearch api.
-type Backend struct {
+type MarijaClient struct {
 	Config
 
-	ch chan map[string]interface{}
+	wg sync.WaitGroup
+
+	done chan struct{}
+	ch   chan map[string]interface{}
 }
 
-func WithURL(u string) func(*Backend) error {
-	return func(b *Backend) error {
+func WithURL(u string) func(*MarijaClient) error {
+	return func(b *MarijaClient) error {
 		b.URL = u
 		return nil
 	}
 }
 
-func New(options ...func(*Backend) error) (*Backend, error) {
+func New(options ...func(*MarijaClient) error) (*MarijaClient, error) {
 	ch := make(chan map[string]interface{}, 100)
 
-	c := Backend{
-		ch: ch,
+	c := MarijaClient{
+		ch:   ch,
+		wg:   sync.WaitGroup{},
+		done: make(chan struct{}),
 	}
 
 	for _, optionFn := range options {
@@ -82,14 +87,20 @@ func Insecure(config *tls.Config) *tls.Config {
 	return config
 }
 
-func (hc Backend) Start(ctx context.Context) {
-	go hc.run(ctx)
+func (hc *MarijaClient) Start() {
+	hc.wg.Add(1)
+	go hc.run()
 }
 
-func (hc Backend) Stop() {
+func (hc *MarijaClient) Stop() {
+	close(hc.ch)
+
+	hc.wg.Wait()
 }
 
-func (hc Backend) run(ctx context.Context) {
+func (hc *MarijaClient) run() {
+	defer hc.wg.Done()
+
 	tlsClientConfig := &tls.Config{}
 
 	if hc.Insecure {
@@ -102,6 +113,8 @@ func (hc Backend) run(ctx context.Context) {
 		},
 	}
 
+	var wg sync.WaitGroup
+
 	docs := make([]map[string]interface{}, 0)
 
 	send := func(docs []map[string]interface{}) {
@@ -109,8 +122,12 @@ func (hc Backend) run(ctx context.Context) {
 			return
 		}
 
+		wg.Add(1)
+
 		pr, pw := io.Pipe()
 		go func() {
+			defer wg.Done()
+
 			var err error
 
 			defer pw.CloseWithError(err)
@@ -139,19 +156,24 @@ func (hc Backend) run(ctx context.Context) {
 			fmt.Println("Could not submit event to Marija: %d", resp.StatusCode)
 			return
 		}
-
-		fmt.Println("SEND")
 	}
 
-	defer send(docs)
+	defer func() {
+		send(docs)
+	}()
 
 	for {
 		select {
-		case <-ctx.Done():
-			fmt.Println("canceled")
-			return
-		case doc := <-hc.ch:
+		case doc, ok := <-hc.ch:
+			if !ok {
+				return
+			}
+
 			docs = append(docs, doc)
+
+			if len(docs) < 100 {
+				//				continue
+			}
 
 			send(docs)
 
@@ -164,27 +186,7 @@ func (hc Backend) run(ctx context.Context) {
 	}
 }
 
-func filter(key string) bool {
-	validKeys := []string{
-		"source-ip",
-		"destination-ip",
-		"destination-port",
-	}
-
-	for _, vk := range validKeys {
-		if vk == key {
-			return false
-		}
-	}
-
-	return true
-}
-
 // Send delivers the giving push messages into the internal elastic search endpoint.
-func (hc Backend) Send(message map[string]interface{}) {
-	select {
-	case hc.ch <- message:
-	default:
-		fmt.Println("Could not send more messages, channel full")
-	}
+func (hc *MarijaClient) Send(message map[string]interface{}) {
+	hc.ch <- message
 }
